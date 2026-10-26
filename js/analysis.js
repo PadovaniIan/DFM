@@ -23,6 +23,7 @@ export const RULES = {
   lifterWarnDeg: 12, lifterMaxDeg: 15,
   ejectExtra: 10,           // assumed ejection stroke = part height along pull + this
   textureDraftPer0025: 1.5, // extra draft per 0.025 mm texture depth
+  halfCos: 0.1,             // feature mean normal·d beyond this → clearly core- or cavity-formed
   maxRegions: 60,
 };
 
@@ -186,6 +187,27 @@ function choosePullDirection(model, sinDraft) {
   return best;
 }
 
+// Recessed geometry on each side, weighted by depth. The side with more pockets should be the
+// core (moving half); the part shrinks onto it and stays with the ejectors.
+// d = ejection direction: points from the core toward the cavity.
+function sideVolumes(model, d) {
+  let hmin = Infinity, hmax = -Infinity;
+  for (let i = 0; i < model.P.length; i += 3) {
+    const s = model.P[i] * d.x + model.P[i + 1] * d.y + model.P[i + 2] * d.z;
+    if (s < hmin) hmin = s;
+    if (s > hmax) hmax = s;
+  }
+  let core = 0, cav = 0;
+  const n = new V(), c = new V();
+  for (let t = 0; t < model.T; t++) {
+    const a = model.area[t]; if (!a) continue;
+    const s = getN(model, t, n).dot(d), h = getC(model, t, c).dot(d);
+    if (s < 0) core += a * -s * (h - hmin);   // faces the core
+    else cav += a * s * (hmax - h);           // faces the cavity
+  }
+  return { core, cav, hmin, hmax };
+}
+
 async function classify(model, d, sinDraft, th, mat, nominal, progress) {
   const flags = new Uint8Array(model.T), nd = d.clone().negate();
   const n = new V(), c = new V(), o = new V();
@@ -264,6 +286,10 @@ function evaluateRegion(model, tris, d, mat, partHeight) {
   }
   cen.divideScalar(A); mean.divideScalar(A);
 
+  // Which mold half forms this feature: normal toward +d = cavity (fixed), toward −d = core (moving).
+  const sd = mean.dot(d);
+  const half = sd > RULES.halfCos ? 'cavity' : sd < -RULES.halfCos ? 'core' : 'wall';
+
   // Candidate side-action directions: 8 in the plane ⊥ pull + the feature's mean side normal.
   const e1 = perpendicular(d), e2 = new V().crossVectors(d, e1), dirs = [];
   for (let k = 0; k < 8; k++) dirs.push(e1.clone().multiplyScalar(Math.cos(k * Math.PI / 4)).addScaledVector(e2, Math.sin(k * Math.PI / 4)));
@@ -290,7 +316,7 @@ function evaluateRegion(model, tris, d, mat, partHeight) {
   let rmin = Infinity, rmax = 0;
   for (const p of verts) { const r = p.clone().addScaledVector(d, -p.dot(d)).distanceTo(pc); rmin = Math.min(rmin, r); rmax = Math.max(rmax, r); }
   const depth = Math.min(Math.min(...evals.map(e => e.D)), rmax - rmin);
-  const base = { tris, area: A, centroid: cen, depth };
+  const base = { tris, area: A, centroid: cen, depth, half };
 
   if (mat.stripMm > 0 && depth <= mat.stripMm) return { ...base, status: 'strip' };
 
@@ -302,9 +328,14 @@ function evaluateRegion(model, tris, d, mat, partHeight) {
     slideBlocked = true;
   }
 
+  // Lifters are driven by the ejector plate, so they only work on the core (moving) half.
   const ejectStroke = partHeight + RULES.ejectExtra;
-  let lifterProblem = null;
-  for (const e of evals.filter(e => e.valid >= RULES.validFrac && e.lift >= RULES.validFrac).sort((a, b) => a.D - b.D)) {
+  let lifterProblem = half === 'cavity'
+    ? 'it is formed by the cavity (fixed half), and lifters only work on the ejector half — try flipping the pull direction'
+    : null;
+  const lifterDirs = half === 'cavity' ? []
+    : evals.filter(e => e.valid >= RULES.validFrac && e.lift >= RULES.validFrac).sort((a, b) => a.D - b.D);
+  for (const e of lifterDirs) {
     const travel = e.D + RULES.lifterClearance;
     const angle = Math.atan(travel / ejectStroke) * 180 / Math.PI;
     if (travel > RULES.lifterMaxTravel) { lifterProblem = `lifter would need ${travel.toFixed(1)} mm lateral travel (max ≈${RULES.lifterMaxTravel} mm)`; continue; }
@@ -330,8 +361,12 @@ export async function analyze(model, opts, progress = () => {}) {
   const sinDraft = Math.sin(draftDeg * Math.PI / 180);
 
   progress('Choosing pull direction', 0); await tick();
-  const d = opts.pull === 'auto' ? choosePullDirection(model, sinDraft)
-          : { x: new V(1, 0, 0), y: new V(0, 1, 0), z: new V(0, 0, 1) }[opts.pull];
+  const d = (opts.pull === 'auto' ? choosePullDirection(model, sinDraft)
+          : { x: new V(1, 0, 0), y: new V(0, 1, 0), z: new V(0, 0, 1) }[opts.pull]).clone();
+  const v0 = sideVolumes(model, d);
+  if (v0.core < v0.cav) d.negate();   // put the recessed side on the core
+  if (opts.flip) d.negate();          // user override (⇅ Flip button)
+  const vols = sideVolumes(model, d);
 
   if (!model.th) model.th = await measureThickness(model, f => progress('Measuring wall thickness', f));
   const th = model.th;
@@ -339,9 +374,7 @@ export async function analyze(model, opts, progress = () => {}) {
 
   const flags = await classify(model, d, sinDraft, th, mat, nominal, f => progress('Checking draft & undercuts', f));
 
-  let hmin = Infinity, hmax = -Infinity;
-  for (let i = 0; i < model.P.length; i += 3) { const s = model.P[i] * d.x + model.P[i + 1] * d.y + model.P[i + 2] * d.z; hmin = Math.min(hmin, s); hmax = Math.max(hmax, s); }
-  const partHeight = hmax - hmin;
+  const partHeight = vols.hmax - vols.hmin;
 
   const areaOf = tris => tris.reduce((s, t) => s + model.area[t], 0);
   let groups = groupRegions(model, flags, FLAG.UNDERCUT).map(g => ({ g, a: areaOf(g) }));
@@ -372,6 +405,8 @@ export async function analyze(model, opts, progress = () => {}) {
   const lt = (model.diag / 2) / nominal;
   if (lt > mat.maxLT) issues.push({ severity: 'warn', title: 'Long flow length', tris: [],
     detail: `Flow length/thickness ≈${Math.round(lt)} (centre gate assumed) vs. ≈${mat.maxLT} for ${mat.name}. Add gates or thicken walls.` });
+  if (vols.core < vols.cav) issues.push({ severity: 'warn', title: 'Part may stay on the fixed half', tris: [],
+    detail: 'More recessed geometry faces the cavity than the core, so the part may stick in the cavity instead of staying on the moving half with the ejectors. Try flipping the pull direction.' });
 
   regions.forEach((r, i) => {
     const k = `Undercut ${i + 1}`;
@@ -379,14 +414,18 @@ export async function analyze(model, opts, progress = () => {}) {
     if (r.status === 'strip') Object.assign(it, { severity: 'warn', title: `${k}: strippable`,
       detail: `≈${r.depth.toFixed(2)} mm deep — can be stripped in ${mat.name} with a 30–45° lead-in and room for the part to flex.` });
     else if (r.status === 'slide') {
-      const actuation = r.stroke <= RULES.anglePinMaxStroke ? `angle pin OK (≈${(r.stroke / Math.sin(RULES.anglePinDeg * Math.PI / 180)).toFixed(0)} mm engaged pin length at ${RULES.anglePinDeg}°)`
+      const actuation = r.half === 'cavity'
+        ? 'cavity-side (fixed half) slide — needs a hydraulic cylinder or delayed action (higher cost); flipping the pull direction may put it on the core side'
+        : r.stroke <= RULES.anglePinMaxStroke ? `angle pin OK (≈${(r.stroke / Math.sin(RULES.anglePinDeg * Math.PI / 180)).toFixed(0)} mm engaged pin length at ${RULES.anglePinDeg}°)`
         : r.stroke <= RULES.hydraulicStroke ? 'long angle pin — consider a hydraulic cylinder' : 'hydraulic cylinder required';
       Object.assign(it, { severity: 'warn', title: `${k}: needs a slide`,
         detail: `Depth ≈${r.D.toFixed(1)} mm → slide stroke ≈${r.stroke.toFixed(1)} mm; ${actuation}. Slide path is clear of other features.` });
     } else if (r.status === 'lifter') {
       const warn = r.travel > RULES.lifterWarnTravel || r.angle > RULES.lifterWarnDeg ? ' ⚠ near practical limits — review with toolmaker.' : '';
+      const halfNote = r.half === 'core' ? 'Formed by the core (ejector) half.'
+        : 'Undercut is on a side wall — confirm it is formed by the core (ejector) half.';
       Object.assign(it, { severity: 'warn', title: `${k}: needs a lifter`,
-        detail: `Lateral travel ≈${r.travel.toFixed(1)} mm at ≈${r.angle.toFixed(1)}° with ≈${r.ejectStroke.toFixed(0)} mm ejection stroke. Space behind the undercut is clear. Lifters must sit on the ejector (core) half.${warn}` });
+        detail: `Lateral travel ≈${r.travel.toFixed(1)} mm at ≈${r.angle.toFixed(1)}° with ≈${r.ejectStroke.toFixed(0)} mm ejection stroke. Space behind the undercut is clear. ${halfNote}${warn}` });
     } else Object.assign(it, { severity: 'error', title: `${k}: not moldable as drawn`,
       detail: `${r.reasons.join('; ')}. Options: pass-through core/shut-off, split the feature, collapsible/unscrewing core, or a flexible material to strip it.` });
     issues.push(it);
@@ -398,6 +437,6 @@ export async function analyze(model, opts, progress = () => {}) {
     thinFrac: areaOf(thin) / totalArea, thickFrac: areaOf(thick) / totalArea, draftFrac: areaOf(draft) / totalArea,
     minUndercutDepth: regions.length ? Math.min(...regions.map(r => r.depth)) : Infinity };
 
-  return { pull: d, material: mat, draftDeg, nominal, p10, p90, partHeight, lt, flags, issues,
+  return { pull: d, flipped: !!opts.flip, material: mat, draftDeg, nominal, p10, p90, partHeight, lt, flags, issues,
            suggestions: suggestMaterials(stats), bodies: model.bodies, triangles: model.T };
 }

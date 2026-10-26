@@ -34,10 +34,13 @@ $('material').innerHTML = '<option value="">— Not specified —</option>' +
 const setStatus = (msg, err = false) => { $('status').textContent = msg; $('status').className = err ? 'error' : ''; };
 
 let occtPromise = null, model = null, mesh = null, report = null, activeIssue = null;
+let flipped = false, busy = false;
+const setFlip = v => { flipped = v; $('flip').classList.toggle('on', v); };
+const setButtons = enabled => { $('run').disabled = !enabled; $('flip').disabled = !enabled; };
 const getOcct = () => (occtPromise ??= window.occtimportjs({ locateFile: f => OCCT_DIST + f }));
 
 $('file').addEventListener('change', async e => {
-  const file = e.target.files[0]; if (!file) return;
+  const file = e.target.files[0]; if (!file || busy) return;
   try {
     setStatus('Loading STEP engine (first time only)…');
     const occt = await getOcct();
@@ -47,14 +50,18 @@ $('file').addEventListener('change', async e => {
                                          linearDeflection: 0.003, angularDeflection: 0.5 });
     if (!res.success || !res.meshes.length) throw new Error('Could not read this STEP file.');
     showModel(prepareModel(res.meshes));
-    $('run').disabled = false;
+    setFlip(false);
+    setButtons(true);
     await runAnalysis();
   } catch (err) { console.error(err); setStatus('Error: ' + err.message, true); }
 });
 $('run').addEventListener('click', runAnalysis);
+$('flip').addEventListener('click', () => { if (busy || !model) return; setFlip(!flipped); runAnalysis(); });
+$('pull').addEventListener('change', () => { setFlip(false); if (model) runAnalysis(); });
 
 function showModel(m) {
   if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+  helpers.clear();
   model = m;
   mesh = new THREE.Mesh(m.geom, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.05, side: THREE.DoubleSide }));
   scene.add(mesh);
@@ -92,20 +99,21 @@ function highlight(issue) {
 }
 
 async function runAnalysis() {
-  if (!model) return;
-  $('run').disabled = true;
+  if (!model || busy) return;
+  busy = true; setButtons(false);
   const t0 = performance.now();
   try {
     report = await analyze(model, {
       materialKey: $('material').value || null,
       textureDepth: parseFloat($('texture').value) || 0,
       pull: $('pull').value,
+      flip: flipped,
     }, (label, f) => setStatus(`${label}… ${Math.round(f * 100)}%`));
     renderReport(report);
     highlight(null);
     setStatus(`Done in ${((performance.now() - t0) / 1000).toFixed(1)} s · ${report.triangles.toLocaleString()} triangles`);
   } catch (err) { console.error(err); setStatus('Analysis error: ' + err.message, true); }
-  $('run').disabled = false;
+  busy = false; setButtons(true);
 }
 
 const fmtVec = v => {
@@ -120,7 +128,8 @@ function renderReport(r) {
     <h2>Summary</h2>
     <table>
       <tr><td>Material rules</td><td>${r.material.name}</td></tr>
-      <tr><td>Pull direction</td><td>${fmtVec(r.pull)} (blue arrow)</td></tr>
+      <tr><td>Pull direction</td><td>${fmtVec(r.pull)}${r.flipped ? ' (flipped)' : ''}</td></tr>
+      <tr><td colspan="2" class="small">Blue arrow = ejection direction. It points from the core (moving half, ejectors, lifters) toward the cavity (fixed half).</td></tr>
       <tr><td>Nominal wall</td><td>${r.nominal.toFixed(2)} mm (10–90%: ${r.p10.toFixed(2)}–${r.p90.toFixed(2)})</td></tr>
       <tr><td>Required draft</td><td>${r.draftDeg.toFixed(2)}°</td></tr>
       <tr><td>Flow length / t</td><td>≈${Math.round(r.lt)} (centre gate)</td></tr>

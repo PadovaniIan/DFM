@@ -31,12 +31,15 @@
     <label>Texture depth, mm (optional)
       <input type="number" id="texture" min="0" step="0.005" placeholder="0 = polished">
     </label>
-    <label>Pull direction
+    <label for="pull">Pull direction</label>
+    <div class="row">
       <select id="pull">
         <option value="auto">Auto</option>
         <option value="x">X</option><option value="y">Y</option><option value="z">Z</option>
       </select>
-    </label>
+      <button id="flip" type="button" disabled
+              title="Swap which side is the core (moving half) and which is the cavity (fixed half)">⇅ Flip</button>
+    </div>
     <button id="run" disabled>Analyze</button>
 
     <div id="status"></div>
